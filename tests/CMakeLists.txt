@@ -18,3 +18,7 @@ add_executable(single_queue_test single_queue_test.cpp)
 target_link_libraries(single_queue_test PRIVATE qlib::qlib GTest::gtest_main Threads::Threads)
 # 进程级超时兜底；并发用例还在两侧检查截止时间，并先停止、join 再断言。
 gtest_discover_tests(single_queue_test PROPERTIES TIMEOUT 120)
+
+# 基准单独运行，不作为 CTest 功能测试，也不链接测试框架。
+add_executable(map_bench map_bench.cpp)
+target_link_libraries(map_bench PRIVATE qlib::qlib)

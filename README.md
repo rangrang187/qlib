@@ -272,6 +272,26 @@ int main() {
 [v3-consumer](docs/validation/v3-consumer/main.cpp)，测试中的
 [SingleQueueConcurrent](tests/single_queue_test.cpp) 还验证主动停止与失败路径。
 
+## 事件、订单存储和索引组合
+
+`single_queue<feed_event>` 传递事件值；唯一消费者独占 `hive<order>` 和
+`map<std::int64_t, order*>`。生产者不访问订单存储，也不传递可供另一侧解引用的订单地址。
+索引中的地址只借用 hive 里仍存活的订单；两个容器不自动组成事务。
+
+新增时先在 hive 构造候选，再建立索引。重复 ID 保留旧对象、旧字段和旧映射，回收新候选；
+索引提交前抛异常时，同样回收候选并继续传播异常。删除时先移除索引，再销毁订单。
+双方完成并 join 后，清空时也先 `by_id.clear()`，再 `orders.clear()`。
+
+本版样例只处理新增和全撤：撤单须匹配 ID、品种、方向与全部剩余量；数量不符保持原单。
+`modify`、成交和价位事件只验证字段交接，不更新订单。完整的十事件输入、独立预期及
+单/双线程代码见 [EventStorageIntegration](tests/single_queue_test.cpp)。
+这套规则用于演示组件协作，业务程序须自行确定订单处理规则。
+
+满时重试同一个事件，成功后才推进发送序号。正常结束使用独立的生产者完成标志 `done`
+发布完成状态；消费者 acquire 观察完成后再次出队，确认最后的发布没有被早先空观察漏掉。
+异常、主动停止或截止时间到达时，两侧停止并 join，随后报告已经处理的数量；
+队列析构清理剩余元素不代表业务处理成功。主线程不在工作期间通过 `size/empty` 判断完成。
+
 ## 构建和测试
 
 需要支持 C++23 的 GCC 或 Clang、CMake 3.28+、Git 和本地构建工具。
@@ -345,9 +365,53 @@ int main() {
 
 该检查在 Release 中仍执行；它验证数据保存和类型分派，不执行撤单业务。
 可复用的独立工程源码见 [v0-consumer](docs/validation/v0-consumer/CMakeLists.txt)。
+六个公共头分别使用的最小工程见本地 [v4-consumer](docs/validation/v4-consumer/CMakeLists.txt)。
+复制该目录到库源码树外，配置时传入 `-DQLIB_SOURCE_DIR=/path/to/qlib`，编译后运行
+`qlib_consumer_v4`。六项检查始终全部执行，失败返回非零；不靠 Release 中可能关闭的 `assert`。
+六个检查分别编译，只链接 `qlib::qlib`，没有手动补充头文件路径或 C++ 标准。
 本阶段提供 `add_subdirectory` 接入，不包含 install/package 或 CI。
 
+## map 性能基准
+
+启用测试的 Release 构建会生成独立的 `map_bench`，它只链接 `qlib::qlib`。
+CTest 不运行这个程序，需要另行执行：
+
+```bash
+./build/tests/map_bench
+```
+
+比较 `qlib::map<int,int>` 与 `std::unordered_map<int,int>` 的 insert、find_hit、find_miss、erase。
+双方默认配置、不提前 reserve，共用一百万个键；`mt19937(42)` 依次打乱命中键和未命中键。
+每项测三次取最小值，单位 ns/op。输入、预填和析构在相应计时外；插入增长计入，
+查询和删除的结果累加也计入。stdout 是八行三列无表头 CSV，stderr 应为 `sink=3000009000000`。
+测量时单独运行，保存两个输出通道、退出码和环境。功能正确性由测试另行验证。
+
+2026-10-20，i7-13650HX / WSL2 / GCC 13.3 / libstdc++，Release `-O3 -DNDEBUG`：
+
+| 操作 | qlib::map ns/op | std::unordered_map ns/op |
+| --- | ---: | ---: |
+| insert | 38.0 | 105.4 |
+| find_hit | 14.2 | 13.7 |
+| find_miss | 12.4 | 23.0 |
+| erase | 16.3 | 37.3 |
+
+本次命中查询标准库略快，其余三项 qlib 较快。三次最小值不能表示 p99、最坏单次延迟
+或其他负载的性能；本次未绑定 CPU，也没有隔离整个系统的后台负载。
+原始结果、计时范围和复现条件见本地 [V4 验收记录](docs/validation/V4.md)。
+
 ## 验证记录
+
+V4 于 2026-10-20 完成，工作区标识 `qlib-v4-20261020`；V0—V4 共 10 项任务、5 个版本完成。
+本次先重跑原有 142 项，再加入 9 项 EventStorageIntegration。最终全新 Release 和
+启用泄漏检测的 ASan/UBSan 各通过 151/151；TSan 覆盖队列及事件组合，通过 35/35，
+均无失败、跳过或工具报告。TSan 普通启动的地址映射错误在无 qlib 探针中复现，
+对相应进程使用 `setarch x86_64 -R` 后通过。
+四种全新构建配置、外部六头独立调用及八行基准格式检查均通过。
+`atomic<uint64_t>` 编译期与运行期无锁检查均为 true；同步和固定存储结论另经代码审查。
+完整命令、原始性能数据、源码 SHA-256、16 项 FR 与 8 项 NFR 的证据对应关系见本地
+[V4 验收记录](docs/validation/V4.md)。没有剩余必需项或阻塞；其他平台和生产尾延迟未验证。
+本次新增临时构建、依赖和探针用完清理，保留必要的手写源码和规定的测量证据。
+
 
 V3 于 2026-10-19 完成，工作区标识 `qlib-v3-20261019`。开发前重跑 116 项旧测试，
 新增 26 项队列测试后，Release 与启用泄漏检测的 ASan/UBSan 均通过 142/142；
@@ -379,10 +443,11 @@ common_test 与 CTest 均通过 17 个用例（0 失败、0 跳过）；独立�
 该记录描述 V0 当时的工作区和验收状态。
 V1 验收结果见本地 [V1 验收记录](docs/validation/V1.md)。
 `docs/validation/` 保存手写调用源码和简短验证记录，并按项目约定不上传 GitHub。
-V0—V3 已完成；V4 尚未开始，性能基准及其他平台未验证。
+V4 的本次验收结果见上方记录；其他平台仍未验证。
 
 开发范围见 [Sprint Backlog](docs/Sprint_Backlog.md)，字段与行为以
 [需求](docs/requirement.md) 和 [规格](docs/specs.md) 为准。
 实施步骤见 [V0 计划](<docs/Implementation_Plan (V0).md>)、[V1 计划](docs/Implementation_Plan(V1).md)、
-[V2 计划](<docs/Implementation_Plan (V2).md>) 和 [V3 计划](<docs/Implementation_Plan (V3).md>)。
+[V2 计划](<docs/Implementation_Plan (V2).md>)、[V3 计划](<docs/Implementation_Plan (V3).md>)
+和 [V4 计划](<docs/Implementation_Plan (V4).md>)。
 公共定义参考 qlib v0.5.1；保留参考项目的 [Apache 2.0 许可证](LICENSE)。

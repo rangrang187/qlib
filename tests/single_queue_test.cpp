@@ -1,7 +1,11 @@
+#include <qlib/common.h>
+#include <qlib/hive.h>
+#include <qlib/map.h>
 #include <qlib/single_queue.h>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -17,6 +21,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -906,6 +911,651 @@ TEST(SingleQueueConcurrent, SQ07SecondThreadLaunchFailureJoinsFirstThread) {
   EXPECT_FALSE(producer.exception) << exception_message(producer.exception);
   EXPECT_LE(producer.completed, 1u);
   EXPECT_EQ(queue.size(), producer.completed);
+}
+
+using orders_type = qlib::hive<qlib::order>;
+using index_type = qlib::map<std::int64_t, qlib::order*>;
+using event_queue = qlib::single_queue<qlib::feed_event>;
+
+static_assert(std::is_nothrow_move_constructible_v<qlib::feed_event>);
+static_assert(std::is_nothrow_destructible_v<qlib::feed_event>);
+
+enum class event_outcome { added, duplicate, cancelled, missing, mismatch, ignored };
+
+template <typename Record>
+Record event_record(std::int64_t seq, qlib::side side) {
+  Record record{};
+  record.seq = seq;
+  record.instrument_id = 1;
+  record.side = side;
+  record.event_ns = 1000 + seq;
+  record.recv_ns = 2000 + seq;
+  return record;
+}
+
+qlib::feed_event order_event(std::int64_t seq, std::int64_t id, qlib::side side,
+                             std::int64_t price, std::int64_t qty) {
+  auto record = event_record<qlib::order>(seq, side);
+  record.order_id = id;
+  record.price = price * qlib::price_scale;
+  record.qty = qty * qlib::qty_scale;
+  record.new_qty = 0;
+  record.prev = nullptr;
+  record.next = nullptr;
+  record.type = qlib::order_type::limit;
+  record.action = qlib::order_action::add;
+  return qlib::feed_event{record};
+}
+
+qlib::feed_event cancel_event(std::int64_t seq, std::int64_t id, qlib::side side,
+                              std::int64_t qty) {
+  auto record = event_record<qlib::cancel>(seq, side);
+  record.order_id = id;
+  record.qty = qty * qlib::qty_scale;
+  return qlib::feed_event{record};
+}
+
+std::array<qlib::feed_event, 10> fixed_events() {
+  auto trade = event_record<qlib::trade>(9, qlib::side::buy);
+  trade.buy_order_id = 303;
+  trade.sell_order_id = 404;
+  trade.price = 99 * qlib::price_scale;
+  trade.qty = qlib::qty_scale;
+  auto level = event_record<qlib::level>(10, qlib::side::sell);
+  level.price = 102 * qlib::price_scale;
+  level.qty = 5 * qlib::qty_scale;
+  return {order_event(1, 101, qlib::side::buy, 100, 2),
+          order_event(2, 202, qlib::side::sell, 101, 3),
+          order_event(3, 101, qlib::side::buy, 999, 9),
+          cancel_event(4, 999, qlib::side::buy, 1),
+          cancel_event(5, 101, qlib::side::buy, 1),
+          cancel_event(6, 101, qlib::side::buy, 2),
+          order_event(7, 303, qlib::side::buy, 99, 4),
+          cancel_event(8, 202, qlib::side::sell, 3),
+          qlib::feed_event{trade}, qlib::feed_event{level}};
+}
+
+struct expected_event {
+  std::int64_t seq;
+  std::size_t tag;
+  std::int64_t id;
+  std::int64_t second_id;
+  std::int64_t price;
+  std::int64_t qty;
+  qlib::side side;
+  event_outcome outcome;
+  std::vector<std::int64_t> live_ids;
+};
+
+// 预期字段和集合逐项填写，独立于事件构造与消费逻辑。
+const std::array<expected_event, 10> expected_events{{
+    {1, qlib::order_tag, 101, 0, 1'000'000'000'000, 200'000'000, qlib::side::buy,
+     event_outcome::added, {101}},
+    {2, qlib::order_tag, 202, 0, 1'010'000'000'000, 300'000'000, qlib::side::sell,
+     event_outcome::added, {101, 202}},
+    {3, qlib::order_tag, 101, 0, 9'990'000'000'000, 900'000'000, qlib::side::buy,
+     event_outcome::duplicate, {101, 202}},
+    {4, qlib::cancel_tag, 999, 0, 0, 100'000'000, qlib::side::buy,
+     event_outcome::missing, {101, 202}},
+    {5, qlib::cancel_tag, 101, 0, 0, 100'000'000, qlib::side::buy,
+     event_outcome::mismatch, {101, 202}},
+    {6, qlib::cancel_tag, 101, 0, 0, 200'000'000, qlib::side::buy,
+     event_outcome::cancelled, {202}},
+    {7, qlib::order_tag, 303, 0, 990'000'000'000, 400'000'000, qlib::side::buy,
+     event_outcome::added, {202, 303}},
+    {8, qlib::cancel_tag, 202, 0, 0, 300'000'000, qlib::side::sell,
+     event_outcome::cancelled, {303}},
+    {9, qlib::trade_tag, 303, 404, 990'000'000'000, 100'000'000, qlib::side::buy,
+     event_outcome::ignored, {303}},
+    {10, qlib::level_tag, 0, 0, 1'020'000'000'000, 500'000'000, qlib::side::sell,
+     event_outcome::ignored, {303}},
+}};
+
+void expect_event_fields(const qlib::feed_event& event, const expected_event& expected) {
+  ASSERT_EQ(event.index(), expected.tag);
+  std::visit([&](const auto& record) {
+    using record_type = std::decay_t<decltype(record)>;
+    EXPECT_EQ(record.seq, expected.seq);
+    EXPECT_EQ(record.instrument_id, 1u);
+    EXPECT_EQ(record.side, expected.side);
+    EXPECT_EQ(record.qty, expected.qty);
+    EXPECT_EQ(record.event_ns, 1000 + expected.seq);
+    EXPECT_EQ(record.recv_ns, 2000 + expected.seq);
+    if constexpr (!std::is_same_v<record_type, qlib::cancel>) {
+      EXPECT_EQ(record.price, expected.price);
+    }
+    if constexpr (std::is_same_v<record_type, qlib::order> ||
+                  std::is_same_v<record_type, qlib::cancel>) {
+      EXPECT_EQ(record.order_id, expected.id);
+    }
+    if constexpr (std::is_same_v<record_type, qlib::order>) {
+      EXPECT_EQ(record.type, qlib::order_type::limit);
+      EXPECT_EQ(record.action, qlib::order_action::add);
+      EXPECT_EQ(record.new_qty, 0);
+      EXPECT_EQ(record.prev, nullptr);
+      EXPECT_EQ(record.next, nullptr);
+    }
+    if constexpr (std::is_same_v<record_type, qlib::trade>) {
+      EXPECT_EQ(record.buy_order_id, expected.id);
+      EXPECT_EQ(record.sell_order_id, expected.second_id);
+    }
+  }, event);
+}
+
+template <typename BeforeIndex>
+bool add_indexed(orders_type& orders, index_type& by_id, const qlib::order& input,
+                 BeforeIndex before_index) {
+  const auto position = orders.emplace(input);
+  bool inserted = false;
+  try {
+    before_index();
+    inserted = by_id.try_emplace(std::int64_t{input.order_id},
+                                 std::addressof(*position)).second;
+  } catch (...) {
+    orders.erase(position);
+    throw;
+  }
+  if (!inserted) orders.erase(position);
+  return inserted;
+}
+
+template <typename BeforeIndex>
+event_outcome consume_event(const qlib::feed_event& event, orders_type& orders,
+                            index_type& by_id, BeforeIndex before_index) {
+  if (const auto* order = std::get_if<qlib::order>(&event)) {
+    if (order->action == qlib::order_action::add) {
+      return add_indexed(orders, by_id, *order, before_index)
+                 ? event_outcome::added : event_outcome::duplicate;
+    }
+  } else if (const auto* cancel = std::get_if<qlib::cancel>(&event)) {
+    const auto found = by_id.find(cancel->order_id);
+    if (found == by_id.end()) return event_outcome::missing;
+    const auto* order = found->second;
+    if (cancel->instrument_id != order->instrument_id || cancel->side != order->side ||
+        cancel->qty != order->qty) {
+      return event_outcome::mismatch;
+    }
+    const auto position = orders.get_iterator(found->second);
+    by_id.erase(found);
+    orders.erase(position);
+    return event_outcome::cancelled;
+  }
+  return event_outcome::ignored;
+}
+
+struct stored_order {
+  qlib::order value;
+  std::uintptr_t address;
+};
+
+struct storage_snapshot {
+  std::vector<stored_order> orders;
+  std::vector<std::int64_t> indexed_ids;
+  bool indexes_are_live = true;
+};
+
+storage_snapshot observe_storage(const orders_type& orders, const index_type& by_id) {
+  storage_snapshot snapshot;
+  for (const auto& order : orders) {
+    snapshot.orders.push_back({order, reinterpret_cast<std::uintptr_t>(std::addressof(order))});
+  }
+  for (const auto& [id, pointer] : by_id) {
+    snapshot.indexed_ids.push_back(id);
+    bool found_live = false;
+    for (const auto& order : orders) {
+      if (std::addressof(order) == pointer && order.order_id == id) found_live = true;
+    }
+    snapshot.indexes_are_live = snapshot.indexes_are_live && found_live;
+  }
+  std::sort(snapshot.orders.begin(), snapshot.orders.end(),
+            [](const auto& left, const auto& right) {
+    return left.value.order_id < right.value.order_id;
+  });
+  std::sort(snapshot.indexed_ids.begin(), snapshot.indexed_ids.end());
+  return snapshot;
+}
+
+void expect_storage(const storage_snapshot& snapshot, const std::vector<std::int64_t>& ids) {
+  EXPECT_TRUE(snapshot.indexes_are_live);
+  EXPECT_EQ(snapshot.indexed_ids, ids);
+  ASSERT_EQ(snapshot.orders.size(), ids.size());
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    SCOPED_TRACE(ids[i]);
+    EXPECT_EQ(snapshot.orders[i].value.order_id, ids[i]);
+    const auto expected_position = ids[i] == 101 ? 0u : ids[i] == 202 ? 1u : 6u;
+    expect_event_fields(qlib::feed_event{snapshot.orders[i].value},
+                        expected_events[expected_position]);
+  }
+}
+
+struct event_log {
+  std::vector<qlib::feed_event> received;
+  std::vector<event_outcome> outcomes;
+  std::vector<storage_snapshot> states;
+};
+
+template <typename BeforeIndex>
+void record_event(const qlib::feed_event& event, orders_type& orders, index_type& by_id,
+                  event_log& log, BeforeIndex before_index) {
+  const auto position = log.received.size();
+  if (position >= expected_events.size() || event.index() != expected_events[position].tag ||
+      std::visit([](const auto& record) { return record.seq; }, event) !=
+          expected_events[position].seq) {
+    throw std::runtime_error("事件类型或序号错误");
+  }
+  log.received.push_back(event);
+  log.outcomes.push_back(consume_event(event, orders, by_id, before_index));
+  log.states.push_back(observe_storage(orders, by_id));
+}
+
+void expect_event_log(const event_log& log, std::size_t count) {
+  ASSERT_EQ(log.received.size(), count);
+  ASSERT_EQ(log.outcomes.size(), count);
+  ASSERT_EQ(log.states.size(), count);
+  for (std::size_t i = 0; i < count; ++i) {
+    SCOPED_TRACE(i + 1);
+    expect_event_fields(log.received[i], expected_events[i]);
+    EXPECT_EQ(log.outcomes[i], expected_events[i].outcome);
+    expect_storage(log.states[i], expected_events[i].live_ids);
+    if (i == 0) continue;
+    for (const auto& current : log.states[i].orders) {
+      for (const auto& previous : log.states[i - 1].orders) {
+        if (previous.value.order_id == current.value.order_id) {
+          EXPECT_EQ(current.address, previous.address);
+        }
+      }
+    }
+  }
+}
+
+void clear_storage(orders_type& orders, index_type& by_id) {
+  const auto count = orders.size();
+  by_id.clear();
+  EXPECT_TRUE(by_id.empty());
+  EXPECT_EQ(orders.size(), count);
+  orders.clear();
+  EXPECT_TRUE(orders.empty());
+}
+
+void produce_events(event_queue& queue, const std::array<qlib::feed_event, 10>& inputs,
+                    std::vector<std::int64_t>& sent, transfer_control& control,
+                    worker_result& result, std::atomic<bool>& done, pace selected) {
+  while (result.completed < inputs.size() && control.keep_running(result)) {
+    auto pending = inputs[result.completed];
+    while (control.keep_running(result)) {
+      if (queue.try_push(std::move(pending))) {
+        sent.push_back(std::visit([](const auto& record) { return record.seq; },
+                                 inputs[result.completed]));
+        ++result.completed;
+        if (selected == pace::producer_yields) std::this_thread::yield();
+        break;
+      }
+      ++result.retries;
+      std::this_thread::yield();
+    }
+  }
+  done.store(true, std::memory_order_release);
+}
+
+template <typename Receive>
+void receive_events(event_queue& queue, transfer_control& control, worker_result& result,
+                    const std::atomic<bool>& done, pace selected, Receive receive) {
+  while (control.keep_running(result)) {
+    auto event = queue.try_pop();
+    if (!event && done.load(std::memory_order_acquire)) {
+      // 完成通知之后重新取值，覆盖首次空观察与最后一次发布之间的交错。
+      event = queue.try_pop();
+      if (!event) {
+        if (result.completed != expected_events.size()) {
+          result.failure = "生产者结束时事件尚未收齐";
+          control.request_stop();
+        }
+        return;
+      }
+    }
+    if (event) {
+      receive(*event);
+      ++result.completed;
+      if (selected == pace::consumer_yields) std::this_thread::yield();
+    } else {
+      ++result.retries;
+      std::this_thread::yield();
+    }
+  }
+}
+
+void run_fixed_scenario(bool threaded, pace selected = pace::balanced) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  event_queue queue(2);
+  event_log log;
+  std::vector<std::int64_t> sent;
+  const auto receive = [&](const qlib::feed_event& event) {
+    record_event(event, orders, by_id, log, [] {});
+  };
+  if (threaded) {
+    transfer_control control;
+    worker_result producer;
+    worker_result consumer;
+    std::atomic<bool> done{false};
+    thread_pair threads(control);
+    threads.start_producer(producer, [&] {
+      produce_events(queue, inputs, sent, control, producer, done, selected);
+    });
+    threads.start_consumer(consumer, [&] {
+      receive_events(queue, control, consumer, done, selected, receive);
+    });
+    threads.join();
+    expect_clean_workers(producer, consumer);
+    EXPECT_FALSE(producer.stopped);
+    EXPECT_FALSE(consumer.stopped);
+    EXPECT_EQ(producer.completed, 10u);
+    EXPECT_EQ(consumer.completed, 10u);
+    EXPECT_TRUE(done.load(std::memory_order_acquire));
+  } else {
+    const auto send = [&](qlib::feed_event& pending) {
+      const auto seq = std::visit([](const auto& record) { return record.seq; }, pending);
+      if (!queue.try_push(std::move(pending))) return false;
+      sent.push_back(seq);
+      return true;
+    };
+    const auto capacity = queue.capacity();
+    ASSERT_LT(capacity, inputs.size());
+    while (sent.size() < capacity) {
+      auto pending = inputs[sent.size()];
+      ASSERT_TRUE(send(pending));
+    }
+    auto pending = inputs[sent.size()];
+    ASSERT_FALSE(send(pending));
+    EXPECT_EQ(sent.size(), capacity);
+    expect_event_fields(pending, expected_events[capacity]);
+    auto first = queue.try_pop();
+    ASSERT_TRUE(first);
+    receive(*first);
+    ASSERT_TRUE(send(pending));
+    while (sent.size() < inputs.size()) {
+      pending = inputs[sent.size()];
+      while (!send(pending)) {
+        auto event = queue.try_pop();
+        ASSERT_TRUE(event);
+        receive(*event);
+      }
+    }
+    while (const auto event = queue.try_pop()) receive(*event);
+  }
+  EXPECT_EQ(sent, (std::vector<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+  expect_event_log(log, 10);
+  const auto final_state = observe_storage(orders, by_id);
+  expect_storage(final_state, {303});
+  EXPECT_FALSE(by_id.contains(101));
+  EXPECT_FALSE(by_id.contains(202));
+  EXPECT_FALSE(by_id.contains(999));
+  const auto final = by_id.find(303);
+  ASSERT_NE(final, by_id.end());
+  ASSERT_TRUE(final_state.indexes_are_live);
+  expect_event_fields(qlib::feed_event{*final->second}, expected_events[6]);
+  EXPECT_TRUE(queue.empty());
+  EXPECT_EQ(queue.size(), 0u);
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, FixedEventsRetryFullQueueAndPreserveEveryState) {
+  run_fixed_scenario(false);
+}
+
+TEST(EventStorageIntegration, FixedEventsTransferAcrossTwoThreadsAtDifferentPaces) {
+  for (const auto selected : {pace::balanced, pace::producer_yields, pace::consumer_yields}) {
+    SCOPED_TRACE(static_cast<int>(selected));
+    run_fixed_scenario(true, selected);
+  }
+}
+
+TEST(EventStorageIntegration, DuplicateKeepsOriginalFieldsAndPointerAndReclaimsCandidate) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  ASSERT_TRUE(add_indexed(orders, by_id, std::get<qlib::order>(inputs[0]), [] {}));
+  const auto* original = by_id.at(101);
+  std::size_t candidate_count = 0;
+  EXPECT_FALSE(add_indexed(orders, by_id, std::get<qlib::order>(inputs[2]), [&] {
+    candidate_count = orders.size();
+  }));
+  EXPECT_EQ(candidate_count, 2u);
+  EXPECT_EQ(by_id.at(101), original);
+  expect_storage(observe_storage(orders, by_id), {101});
+  clear_storage(orders, by_id);
+}
+
+struct index_commit_failure : std::runtime_error {
+  index_commit_failure() : std::runtime_error("索引提交前失败") {}
+};
+
+TEST(EventStorageIntegration, FailureBeforeIndexReclaimsCandidateAndPropagates) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  ASSERT_TRUE(add_indexed(orders, by_id, std::get<qlib::order>(inputs[0]), [] {}));
+  const auto* original = by_id.at(101);
+  for (const auto position : {1u, 2u}) {
+    SCOPED_TRACE(position);
+    std::size_t candidate_count = 0;
+    EXPECT_THROW(add_indexed(orders, by_id, std::get<qlib::order>(inputs[position]), [&] {
+      candidate_count = orders.size();
+      throw index_commit_failure{};
+    }), index_commit_failure);
+    EXPECT_EQ(candidate_count, 2u);
+    EXPECT_EQ(by_id.at(101), original);
+    expect_storage(observe_storage(orders, by_id), {101});
+  }
+  EXPECT_FALSE(by_id.contains(202));
+  ASSERT_TRUE(add_indexed(orders, by_id, std::get<qlib::order>(inputs[1]), [] {}));
+  expect_storage(observe_storage(orders, by_id), {101, 202});
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, CancelRequiresMatchingInstrumentSideAndWholeQuantity) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  ASSERT_EQ(consume_event(inputs[0], orders, by_id, [] {}), event_outcome::added);
+  ASSERT_EQ(consume_event(inputs[1], orders, by_id, [] {}), event_outcome::added);
+  for (int field = 0; field < 3; ++field) {
+    auto cancel = std::get<qlib::cancel>(inputs[5]);
+    if (field == 0) cancel.instrument_id = 2;
+    if (field == 1) cancel.side = qlib::side::sell;
+    if (field == 2) cancel.qty = qlib::qty_scale;
+    EXPECT_EQ(consume_event(qlib::feed_event{cancel}, orders, by_id, [] {}),
+              event_outcome::mismatch);
+    expect_storage(observe_storage(orders, by_id), {101, 202});
+  }
+  auto modify = std::get<qlib::order>(inputs[0]);
+  modify.action = qlib::order_action::modify;
+  modify.new_qty = 9 * qlib::qty_scale;
+  EXPECT_EQ(consume_event(qlib::feed_event{modify}, orders, by_id, [] {}),
+            event_outcome::ignored);
+  expect_storage(observe_storage(orders, by_id), {101, 202});
+  EXPECT_EQ(consume_event(inputs[5], orders, by_id, [] {}), event_outcome::cancelled);
+  EXPECT_EQ(consume_event(inputs[5], orders, by_id, [] {}), event_outcome::missing);
+  expect_storage(observe_storage(orders, by_id), {202});
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, ExternalStopJoinsWorkersWithPendingEvents) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  event_queue queue(2);
+  event_log log;
+  transfer_control control;
+  worker_result producer;
+  worker_result consumer;
+  std::atomic<bool> consumer_paused{false};
+  std::atomic<bool> full_after_pause{false};
+  bool main_timed_out = false;
+  thread_pair threads(control);
+  threads.start_producer(producer, [&] {
+    while (producer.completed < inputs.size() && control.keep_running(producer)) {
+      auto pending = inputs[producer.completed];
+      while (control.keep_running(producer)) {
+        if (queue.try_push(std::move(pending))) {
+          ++producer.completed;
+          break;
+        }
+        if (producer.completed == 4) full_after_pause.store(true, std::memory_order_relaxed);
+        std::this_thread::yield();
+      }
+    }
+  });
+  threads.start_consumer(consumer, [&] {
+    while (control.keep_running(consumer)) {
+      if (consumer.completed == 2) {
+        consumer_paused.store(true, std::memory_order_relaxed);
+        std::this_thread::yield();
+        continue;
+      }
+      if (const auto event = queue.try_pop()) {
+        record_event(*event, orders, by_id, log, [] {});
+        ++consumer.completed;
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+  while ((!consumer_paused.load(std::memory_order_relaxed) ||
+          !full_after_pause.load(std::memory_order_relaxed)) &&
+         !control.stop.load(std::memory_order_relaxed)) {
+    if (std::chrono::steady_clock::now() >= control.deadline) {
+      main_timed_out = true;
+      break;
+    }
+    std::this_thread::yield();
+  }
+  control.request_stop();
+  threads.join();
+  expect_clean_workers(producer, consumer);
+  EXPECT_FALSE(main_timed_out);
+  EXPECT_TRUE(consumer_paused.load(std::memory_order_relaxed));
+  EXPECT_TRUE(full_after_pause.load(std::memory_order_relaxed));
+  EXPECT_TRUE(producer.stopped);
+  EXPECT_TRUE(consumer.stopped);
+  EXPECT_EQ(producer.completed, 4u);
+  EXPECT_EQ(consumer.completed, 2u);
+  EXPECT_EQ(queue.size(), 2u);
+  expect_event_log(log, 2);
+  expect_storage(observe_storage(orders, by_id), {101, 202});
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, ConsumerCommitExceptionStopsProducerAndPreservesOldOrder) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  event_queue queue(2);
+  event_log log;
+  transfer_control control;
+  worker_result producer;
+  worker_result consumer;
+  std::vector<std::int64_t> sent;
+  std::atomic<bool> done{false};
+  thread_pair threads(control);
+  threads.start_producer(producer, [&] {
+    produce_events(queue, inputs, sent, control, producer, done, pace::balanced);
+  });
+  threads.start_consumer(consumer, [&] {
+    receive_events(queue, control, consumer, done, pace::balanced,
+                   [&](const qlib::feed_event& event) {
+      record_event(event, orders, by_id, log, [&] {
+        if (consumer.completed == 1) throw index_commit_failure{};
+      });
+    });
+  });
+  threads.join();
+  ASSERT_TRUE(consumer.exception);
+  EXPECT_THROW(std::rethrow_exception(consumer.exception), index_commit_failure);
+  EXPECT_FALSE(producer.exception) << exception_message(producer.exception);
+  EXPECT_FALSE(producer.timed_out);
+  EXPECT_FALSE(consumer.timed_out);
+  EXPECT_TRUE(producer.failure.empty());
+  EXPECT_TRUE(consumer.failure.empty());
+  EXPECT_TRUE(producer.stopped);
+  EXPECT_EQ(consumer.completed, 1u);
+  EXPECT_GE(producer.completed, 2u);
+  EXPECT_LE(producer.completed, 4u);
+  EXPECT_EQ(queue.size(), producer.completed - 2);
+  ASSERT_EQ(log.received.size(), 2u);
+  expect_event_fields(log.received[1], expected_events[1]);
+  ASSERT_EQ(log.outcomes.size(), 1u);
+  EXPECT_EQ(log.outcomes[0], event_outcome::added);
+  expect_storage(observe_storage(orders, by_id), {101});
+  EXPECT_FALSE(by_id.contains(202));
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, SecondThreadLaunchFailureJoinsStartedProducer) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  event_queue queue(2);
+  transfer_control control;
+  worker_result producer;
+  std::vector<std::int64_t> sent;
+  std::atomic<bool> done{false};
+  bool producer_exited = false;
+  bool launch_failed = false;
+  try {
+    thread_pair threads(control);
+    threads.start_producer(producer, [&] {
+      produce_events(queue, inputs, sent, control, producer, done, pace::balanced);
+      producer_exited = true;
+    });
+    // 沿第二线程启动失败的作用域退出路径，通知并回收已启动的生产者。
+    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+  } catch (const std::system_error&) {
+    launch_failed = true;
+  }
+  EXPECT_TRUE(launch_failed);
+  EXPECT_TRUE(producer_exited);
+  EXPECT_TRUE(producer.stopped);
+  EXPECT_FALSE(producer.timed_out);
+  EXPECT_FALSE(producer.exception) << exception_message(producer.exception);
+  EXPECT_LE(producer.completed, 2u);
+  EXPECT_EQ(queue.size(), producer.completed);
+  expect_storage(observe_storage(orders, by_id), {});
+  clear_storage(orders, by_id);
+}
+
+TEST(EventStorageIntegration, ExpiredDeadlineStopsBothWorkersBeforeTransfer) {
+  const auto inputs = fixed_events();
+  orders_type orders;
+  index_type by_id;
+  event_queue queue(2);
+  transfer_control control{.deadline = std::chrono::steady_clock::now()};
+  worker_result producer;
+  worker_result consumer;
+  std::vector<std::int64_t> sent;
+  std::atomic<bool> done{false};
+  thread_pair threads(control);
+  threads.start_producer(producer, [&] {
+    produce_events(queue, inputs, sent, control, producer, done, pace::balanced);
+  });
+  threads.start_consumer(consumer, [&] {
+    receive_events(queue, control, consumer, done, pace::balanced,
+                   [&](const qlib::feed_event& event) {
+      consume_event(event, orders, by_id, [] {});
+    });
+  });
+  threads.join();
+  EXPECT_TRUE(producer.timed_out || consumer.timed_out);
+  EXPECT_TRUE(producer.stopped || producer.timed_out);
+  EXPECT_TRUE(consumer.stopped || consumer.timed_out);
+  EXPECT_FALSE(producer.exception) << exception_message(producer.exception);
+  EXPECT_FALSE(consumer.exception) << exception_message(consumer.exception);
+  EXPECT_EQ(producer.completed, 0u);
+  EXPECT_EQ(consumer.completed, 0u);
+  EXPECT_TRUE(queue.empty());
+  expect_storage(observe_storage(orders, by_id), {});
+  clear_storage(orders, by_id);
 }
 
 }  // namespace
