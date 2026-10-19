@@ -1,9 +1,9 @@
 # qlib
 
 qlib 为 nqbook 等 C++ 项目提供共享数据定义和基础容器。
-已完成 V0—V2：公共数据 `<qlib/common.h>`、地址稳定的对象存储 `<qlib/hive.h>`、
-键值索引 `<qlib/map.h>`、固定块内存池 `<qlib/memory_pool.h>` 和句柄对象池 `<qlib/pool.h>`。
-`single_queue` 留在后续版本实现。
+提供公共数据 `<qlib/common.h>`、地址稳定的对象存储 `<qlib/hive.h>`、
+键值索引 `<qlib/map.h>`、固定块内存池 `<qlib/memory_pool.h>`、句柄对象池 `<qlib/pool.h>`
+和单生产者、单消费者队列 `<qlib/single_queue.h>`。
 
 库采用 C++23、纯头文件结构，运行时仅依赖标准库。`qlib::qlib` 是 CMake 接口目标，
 向调用方传递头文件目录和语言要求，本身不生成库二进制或服务进程。
@@ -221,6 +221,57 @@ int main() {
 同步须覆盖从取得地址或引用到使用结束的整个期间，用户构造、移动和析构也不能重入同一池。
 两个头文件分别接入的完整工程见本地 [v2-consumer](docs/validation/v2-consumer/CMakeLists.txt)。
 
+## 线程间有序交接
+
+`single_queue<T>` 只允许一个生产者入队、一个消费者出队，成功放入的对象按 FIFO 顺序取出。
+请求容量 0、1、5、8、9 时，实际容量分别为 1、1、8、8、16。槽位只在构造时分配，
+运行期间容量固定；所有槽位都可用。队列只能带容量构造，不能复制或移动。
+
+`try_emplace(args...)` 在槽位原地构造，`try_push(T&&)` 转交已有值。
+满时返回 `false`，函数内部不会构造新对象或移动输入；调用方的实参表达式仍会先求值。
+普通参数构造失败时异常向外传播，不发布新项，之后可以继续使用。
+`try_pop()` 空时返回 `std::nullopt`；成功时返回的 `std::optional<T>` 独立拥有值，
+原槽位对象已销毁。返回结果在槽位复用或队列销毁后仍有效。
+
+下面用单线程展示所有权交接和满时重试；双线程运行使用后文的停止与销毁规则。
+
+```cpp
+#include <qlib/single_queue.h>
+#include <memory>
+#include <utility>
+
+int main() {
+  qlib::single_queue<std::unique_ptr<int>> queue(1);
+  if (!queue.try_emplace(std::make_unique<int>(7))) return 1;
+  auto next = std::make_unique<int>(42);
+  if (queue.try_push(std::move(next)) || !next) return 1;
+  auto first = queue.try_pop();
+  if (!first || !*first || **first != 7) return 1;
+  if (!queue.try_push(std::move(next)) || next) return 1;
+  auto second = queue.try_pop();
+  return second && *second && **second == 42 && queue.empty() ? 0 : 1;
+}
+```
+
+`T` 不需要默认构造或复制，但从 `T&&` 构造和析构必须实际不抛异常。
+这些操作可以没有 `noexcept` 声明；队列不增加模板拒绝规则。
+调用方保证容量取整后可由 `size_t` 和 `uint64_t` 表示且小于 `2^64`，
+总字节数不溢出，并满足有效分配条件；队列没有完整的溢出检查。
+
+生产者完成对象构造后，以 release 发布 `tail`，消费者 acquire 接收后读取对象。
+消费者移出并销毁槽位对象后，以 release 发布 `head`，生产者 acquire 接收后复用槽位。
+`tail/cached_head` 由生产者更新，`head/cached_tail` 由消费者更新；每侧只使用自己缓存的
+已确认范围。单次管理操作没有等待对侧推进的循环，满或空时直接返回。
+无锁结论还要求目标平台的原子实现支持；用户对象内部的分配、锁和等待另计。
+
+运行时 `size/empty` 只供生产者或消费者观察，不能代替入出队返回值或作为完成信号。
+第三方线程只能在访问结束并完成同步后查询。双方不得同侧重入；交接线程角色需要外部同步。
+调用方先创建队列，再启动两个线程，用独立的同步停止状态协调退出，最后 `join` 两侧，
+再读取最终结果和销毁队列。队列析构只清理剩余对象，不会替调用方停止线程。
+含截止时间、异常捕获和部分启动失败收尾的完整双线程示例见本地
+[v3-consumer](docs/validation/v3-consumer/main.cpp)，测试中的
+[SingleQueueConcurrent](tests/single_queue_test.cpp) 还验证主动停止与失败路径。
+
 ## 构建和测试
 
 需要支持 C++23 的 GCC 或 Clang、CMake 3.28+、Git 和本地构建工具。
@@ -236,6 +287,7 @@ cmake --build build --parallel
 ./build/tests/map_test
 ./build/tests/memory_pool_test
 ./build/tests/pool_test
+./build/tests/single_queue_test
 ctest --test-dir build -N
 ctest --test-dir build --output-on-failure --no-tests=error
 ```
@@ -243,7 +295,7 @@ ctest --test-dir build --output-on-failure --no-tests=error
 顶层项目的 `QLIB_BUILD_TESTS` 默认 ON，作为子项目时默认 OFF。
 显式传入 `-DQLIB_BUILD_TESTS=OFF` 会关闭测试目标及 GoogleTest 获取流程。
 常规验证只复用一个 `build/`；仅在修改构建配置或排错时额外检查测试开关。
-ASan/UBSan 使用单独临时构建以隔离编译选项，完成后清理本次新建的临时产物。
+ASan/UBSan 与 TSan 分别使用独立临时构建以隔离检查选项，完成后清理本次新建的临时产物。
 `build/compile_commands.json` 由 CMake 生成。
 配置成功和零测试均不算功能验证通过。
 
@@ -258,6 +310,9 @@ add_subdirectory(qlib)
 add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE qlib::qlib)
 ```
+
+调用程序创建线程时，另用 `find_package(Threads REQUIRED)` 查找线程支持，
+再把 `Threads::Threads` 链接到调用目标。库本身不创建线程。
 
 `main.cpp` 只包含公共头，明确填写一条撤单记录并检查读取结果：
 
@@ -294,6 +349,15 @@ int main() {
 
 ## 验证记录
 
+V3 于 2026-10-19 完成，工作区标识 `qlib-v3-20261019`。开发前重跑 116 项旧测试，
+新增 26 项队列测试后，Release 与启用泄漏检测的 ASan/UBSan 均通过 142/142；
+TSan 队列测试通过 26/26，均无失败、跳过或工具报告。TSan 首次遇到运行时地址映射错误，
+对构建及测试进程使用 `setarch x86_64 -R` 后通过，没有更改系统设置。
+每轮完整交接 180 万项多字段载荷和 45 万项独占资源；主动停止及异常收尾也通过。
+独立消费工程完成 10000 项交接，目标 `atomic<uint64_t>` 编译期与运行期检查均为无锁。
+环境仍为 GCC 13.3.0 / libstdc++、CMake 3.28.3、GoogleTest v1.17.0、WSL2 x86-64。
+完整命令、首次失败与修复条件、范围限制见本地 [V3 验收记录](docs/validation/V3.md)。
+
 V2 于 2026-10-16 完成，工作区标识为 `qlib-v2-20261016`。
 本次先实际重跑 V0/V1 的 75 项测试，再加入 memory_pool 的 27 项和 pool 的 14 项。
 最终 Release 和 Debug ASan/UBSan（开启泄漏检测）均通过全部 116 项，0 失败、0 跳过，
@@ -315,10 +379,10 @@ common_test 与 CTest 均通过 17 个用例（0 失败、0 跳过）；独立�
 该记录描述 V0 当时的工作区和验收状态。
 V1 验收结果见本地 [V1 验收记录](docs/validation/V1.md)。
 `docs/validation/` 保存手写调用源码和简短验证记录，并按项目约定不上传 GitHub。
-V3、V4 未开始，性能基准、并发及其他平台未验证。
+V0—V3 已完成；V4 尚未开始，性能基准及其他平台未验证。
 
 开发范围见 [Sprint Backlog](docs/Sprint_Backlog.md)，字段与行为以
 [需求](docs/requirement.md) 和 [规格](docs/specs.md) 为准。
-实施步骤见 [V0 计划](<docs/Implementation_Plan (V0).md>)、[V1 计划](docs/Implementation_Plan(V1).md)
-和 [V2 计划](<docs/Implementation_Plan (V2).md>)。
+实施步骤见 [V0 计划](<docs/Implementation_Plan (V0).md>)、[V1 计划](docs/Implementation_Plan(V1).md)、
+[V2 计划](<docs/Implementation_Plan (V2).md>) 和 [V3 计划](<docs/Implementation_Plan (V3).md>)。
 公共定义参考 qlib v0.5.1；保留参考项目的 [Apache 2.0 许可证](LICENSE)。
