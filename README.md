@@ -1,9 +1,9 @@
 # qlib
 
 qlib 为 nqbook 等 C++ 项目提供共享数据定义和基础容器。
-已完成 V1，在公共数据 `<qlib/common.h>` 的基础上增加 `<qlib/hive.h>` 和 `<qlib/map.h>`，
-用于保存地址稳定的对象，以及按唯一键查找数据。
-`single_queue`、`pool`、`memory_pool` 留在后续版本实现。
+已完成 V0—V2：公共数据 `<qlib/common.h>`、地址稳定的对象存储 `<qlib/hive.h>`、
+键值索引 `<qlib/map.h>`、固定块内存池 `<qlib/memory_pool.h>` 和句柄对象池 `<qlib/pool.h>`。
+`single_queue` 留在后续版本实现。
 
 库采用 C++23、纯头文件结构，运行时仅依赖标准库。`qlib::qlib` 是 CMake 接口目标，
 向调用方传递头文件目录和语言要求，本身不生成库二进制或服务进程。
@@ -140,6 +140,87 @@ int main() {
 这里没有建立订单前后链；业务中若还保存其他借用指针，也须在对象销毁前解除。
 先声明 `orders`、后声明 `by_id`，退出作用域时会先销毁索引，再销毁订单。
 
+## 对象池与原始内存池
+
+| 组件 | 返回什么 | 谁负责对象 | 容量与复用 |
+| --- | --- | --- | --- |
+| `memory_pool` | `void*` 原始块地址 | 调用方构造对象，并在归还前析构对象。 | 构造时固定块数；耗尽返回 `nullptr`，最近归还的块先借出。 |
+| `pool<T>` | `size_type` 槽位句柄 | 池通过 `emplace` 构造，`release` 或池析构销毁。 | 构造参数仅为预留量，空间不足可以增长；最近释放的槽先复用。 |
+
+两种池各自管理存储，必须带参数构造，均不可复制、不可移动，没有 `clear/reset`。
+`empty()` 表示当前没有借出块或存活对象；`size()` 是对应数量。
+固定池借满时 `empty()` 为 false，能否借到下一块要看 `allocate()` 的返回值。
+
+`memory_pool(block_size, capacity, alignment)` 默认使用 `alignof(std::max_align_t)`。
+实际对齐至少为 `alignof(void*)`，实际块大小至少为 `sizeof(void*)`，并向实际对齐的倍数取整。
+两个查询 `block_size()`、`alignment()` 返回实际值；请求块大小与容量都允许为 0。
+对齐必须是平台支持的非零二次幂，取整与总字节数必须可表示，调用方负责满足这些条件。
+即使容量为 0，构造仍调用对齐分配，分配异常会向外传播。
+
+固定池创建后，借还只更新地址、链接和计数，不为池自身申请新存储。
+归还地址必须是本池仍借出的块首地址，不能为 nullptr、偏移地址或重复归还。
+块不会自动清零，归还会覆盖块头；销毁池会释放整段存储，但不会替调用方析构块内对象。
+下面的程序先清理字符串，再归还它所在的块；构造失败时只归还原始块。
+
+```cpp
+#include <qlib/memory_pool.h>
+#include <memory>
+#include <string>
+
+int main() {
+  qlib::memory_pool storage(sizeof(std::string), 1, alignof(std::string));
+  void* raw = storage.allocate();
+  if (raw == nullptr) return 1;
+  std::string* value = nullptr;
+  try {
+    value = std::construct_at(static_cast<std::string*>(raw), "hello");
+  } catch (...) {
+    storage.deallocate(raw);
+    throw;
+  }
+  const bool correct = *value == "hello";
+  std::destroy_at(value);
+  storage.deallocate(raw);
+  return correct && storage.empty() ? 0 : 2;
+}
+```
+
+示例中的使用步骤不抛异常。业务处理若可能抛异常，调用方要用作用域清理保证所有退出路径
+都先析构对象、再归还块。销毁池前可以不逐块归还原始内存，但必须完成对象自身的清理。
+
+`pool<T>(capacity)` 只预留槽空间，不提前构造 T；预留 0 后仍可通过 `emplace` 增长。
+T 的移动构造与析构必须不抛异常；这属于使用条件，模板不新增统一的类型拒绝检查。
+指定参数的新对象构造可以抛异常：复用失败恢复原空闲链，追加失败移除临时末槽，存活数不增加。
+已经完成的增长和地址变化可以保留；每次 `emplace` 成功或失败后，都应凭有效句柄重新取得引用。
+如果构造参数来自池内对象，先在池外暂存所需值，避免增长后继续读取已失效的实参引用。
+
+```cpp
+#include <qlib/pool.h>
+#include <string>
+
+int main() {
+  qlib::pool<std::string> objects(1);
+  const auto first = objects.emplace("first");
+  const auto second = objects.emplace("second");
+  const bool preserved = objects[first] == "first";
+  objects.release(first);
+  const auto replacement = objects.emplace("replacement");
+  const bool reused = replacement == first && objects[replacement] == "replacement";
+  objects.release(replacement);
+  objects.release(second);
+  return preserved && reused && objects.empty() ? 0 : 1;
+}
+```
+
+释放后的旧句柄失效；相同数字再次返回时，调用方保存本次返回的新句柄。
+`release` 销毁对象并保留容量；池析构清理剩余存活对象和全部存储。
+池不会诊断越界、过期或跨池句柄，不支持重复释放或移动对象抛异常后的通用恢复。
+复用和访问的管理步骤为常数，增长要搬迁已有槽位；这些性质不代表性能实测结果。
+
+两种池没有内部锁。无写入时可以并发只读；修改、释放和销毁由调用方同步。
+同步须覆盖从取得地址或引用到使用结束的整个期间，用户构造、移动和析构也不能重入同一池。
+两个头文件分别接入的完整工程见本地 [v2-consumer](docs/validation/v2-consumer/CMakeLists.txt)。
+
 ## 构建和测试
 
 需要支持 C++23 的 GCC 或 Clang、CMake 3.28+、Git 和本地构建工具。
@@ -153,6 +234,8 @@ cmake --build build --parallel
 ./build/tests/common_test
 ./build/tests/hive_test
 ./build/tests/map_test
+./build/tests/memory_pool_test
+./build/tests/pool_test
 ctest --test-dir build -N
 ctest --test-dir build --output-on-failure --no-tests=error
 ```
@@ -211,10 +294,18 @@ int main() {
 
 ## 验证记录
 
+V2 于 2026-10-16 完成，工作区标识为 `qlib-v2-20261016`。
+本次先实际重跑 V0/V1 的 75 项测试，再加入 memory_pool 的 27 项和 pool 的 14 项。
+最终 Release 和 Debug ASan/UBSan（开启泄漏检测）均通过全部 116 项，0 失败、0 跳过，
+未发现工具报错。两个新增头文件的独立调用程序编译、运行均成功；头文件路径与 C++23
+要求由 `qlib::qlib` 传入，子项目默认关闭测试且不引入 GoogleTest。
+实际环境为 WSL2 x86-64、Ubuntu 24.04.4、GCC 13.3.0、CMake 3.28.3、GoogleTest v1.17.0。
+命令、覆盖范围和检查限制见本地 [V2 验收记录](docs/validation/V2.md)。2026-10-16 的开发验收未包含 Git 提交或推送。
+
 V1 于 2026-10-15 完成：Release 和 Debug ASan/UBSan（含泄漏检查）均通过 75 项测试，
 0 失败、0 跳过。包括 V0 的 17 项、hive 的 18 项、map 的 33 项和组合场景的 7 项。
 两个独立头消费程序均通过 `qlib::qlib` 编译并运行成功；子项目默认关闭测试且不引入 GoogleTest。
-当前工作区标识为 `qlib-v1-20261015`，本次未提交或推送 Git。
+V1 开发验收时的工作区标识为 `qlib-v1-20261015`。
 
 2026-10-15 在 WSL2 x86-64、Ubuntu 24.04.4、GCC 13.3.0、CMake 3.28.3 下完成 Release 验证。
 common_test 与 CTest 均通过 17 个用例（0 失败、0 跳过）；独立调用及测试开关矩阵通过。
@@ -224,9 +315,10 @@ common_test 与 CTest 均通过 17 个用例（0 失败、0 跳过）；独立�
 该记录描述 V0 当时的工作区和验收状态。
 V1 验收结果见本地 [V1 验收记录](docs/validation/V1.md)。
 `docs/validation/` 保存手写调用源码和简短验证记录，并按项目约定不上传 GitHub。
-V2—V4 未开始，性能、并发及其他平台未验证。
+V3、V4 未开始，性能基准、并发及其他平台未验证。
 
 开发范围见 [Sprint Backlog](docs/Sprint_Backlog.md)，字段与行为以
 [需求](docs/requirement.md) 和 [规格](docs/specs.md) 为准。
-实施步骤见 [V0 计划](<docs/Implementation_Plan (V0).md>) 和 [V1 计划](docs/Implementation_Plan(V1).md)。
+实施步骤见 [V0 计划](<docs/Implementation_Plan (V0).md>)、[V1 计划](docs/Implementation_Plan(V1).md)
+和 [V2 计划](<docs/Implementation_Plan (V2).md>)。
 公共定义参考 qlib v0.5.1；保留参考项目的 [Apache 2.0 许可证](LICENSE)。

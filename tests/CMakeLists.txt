@@ -7,7 +7,7 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
-foreach(component IN ITEMS common hive map)
+foreach(component IN ITEMS common hive map memory_pool pool)
   add_executable(${component}_test ${component}_test.cpp)
   target_link_libraries(${component}_test PRIVATE qlib::qlib GTest::gtest_main)
   gtest_discover_tests(${component}_test)
